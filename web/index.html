@@ -6,7 +6,7 @@
 #bar{position:fixed;top:0;left:0;right:0;height:38px;display:flex;gap:10px;align-items:center;padding:0 12px;background:var(--bar);z-index:2;transition:transform .2s}
 #bar.hide{transform:translateY(-100%)}
 #st{margin-right:auto}select,button{background:var(--bg);color:var(--fg);border:1px solid #333;border-radius:6px;padding:4px 8px;font:inherit;cursor:pointer}
-#v,#cv{position:fixed;top:38px;left:0;right:0;bottom:0;width:100%;height:calc(100% - 38px);object-fit:contain;background:#000;cursor:none;outline:none}
+#v,#cv{position:fixed;top:38px;left:0;right:0;bottom:0;width:100%;height:calc(100% - 38px);object-fit:contain;background:#000;cursor:default;outline:none}
 #cv{display:none}
 body.fs #v,body.fs #cv{top:0;height:100%}
 </style></head><body>
@@ -39,6 +39,7 @@ function connect(){
   ws.onmessage=async e=>{
     if(e.data instanceof ArrayBuffer){return frame(new Uint8Array(e.data))}
     const m=JSON.parse(e.data);
+    if(m.type==="cursor"){v.style.cursor=cv.style.cursor=m.css;return}
     if(m.type==="config"){cfg=m;
       if(m.mode==="ws"){setupDecoder();st("Connected (compatibility mode)");return}
       pc=new RTCPeerConnection({iceServers:m.ice_servers,bundlePolicy:"max-bundle"});

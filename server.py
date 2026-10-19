@@ -135,6 +135,67 @@ class Input:
             self.d.flush()
 
 
+# ---------------------------------------------------------------- remote cursor shape -> browser CSS cursor
+CURSOR_CSS = {
+    "left_ptr": "default", "arrow": "default", "default": "default", "top_left_arrow": "default",
+    "xterm": "text", "text": "text", "ibeam": "text",
+    "hand1": "pointer", "hand2": "pointer", "pointer": "pointer", "pointing_hand": "pointer",
+    "watch": "wait", "wait": "wait", "left_ptr_watch": "progress", "progress": "progress",
+    "fleur": "move", "move": "move", "all-scroll": "all-scroll", "size_all": "move",
+    "crosshair": "crosshair", "cross": "crosshair", "tcross": "crosshair",
+    "sb_h_double_arrow": "ew-resize", "h_double_arrow": "ew-resize", "ew-resize": "ew-resize", "col-resize": "col-resize",
+    "left_side": "ew-resize", "right_side": "ew-resize", "split_h": "col-resize", "size_hor": "ew-resize",
+    "sb_v_double_arrow": "ns-resize", "v_double_arrow": "ns-resize", "ns-resize": "ns-resize", "row-resize": "row-resize",
+    "top_side": "ns-resize", "bottom_side": "ns-resize", "split_v": "row-resize", "size_ver": "ns-resize",
+    "top_left_corner": "nwse-resize", "bottom_right_corner": "nwse-resize", "nwse-resize": "nwse-resize", "size_fdiag": "nwse-resize",
+    "top_right_corner": "nesw-resize", "bottom_left_corner": "nesw-resize", "nesw-resize": "nesw-resize", "size_bdiag": "nesw-resize",
+    "question_arrow": "help", "help": "help", "whats_this": "help",
+    "not-allowed": "not-allowed", "crossed_circle": "not-allowed", "forbidden": "not-allowed", "no-drop": "no-drop",
+    "grab": "grab", "openhand": "grab", "grabbing": "grabbing", "closedhand": "grabbing", "dnd-none": "grabbing",
+    "copy": "copy", "dnd-copy": "copy", "alias": "alias", "dnd-link": "alias", "context-menu": "context-menu",
+    "zoom-in": "zoom-in", "zoom-out": "zoom-out", "vertical-text": "vertical-text", "cell": "cell",
+}
+CURSOR = {"css": "default"}   # latest shape; anything unknown or hidden falls back to a visible arrow
+
+
+def cursor_watcher(on_change):
+    """Poll the X server's current cursor (XFixes) and report its CSS equivalent when it changes."""
+    import ctypes
+    try:
+        x11, xf = ctypes.CDLL("libX11.so.6"), ctypes.CDLL("libXfixes.so.3")
+
+        class Img(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_short), ("y", ctypes.c_short), ("width", ctypes.c_ushort), ("height", ctypes.c_ushort),
+                        ("xhot", ctypes.c_ushort), ("yhot", ctypes.c_ushort), ("serial", ctypes.c_ulong),
+                        ("pixels", ctypes.c_void_p), ("atom", ctypes.c_ulong), ("name", ctypes.c_char_p)]
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        xf.XFixesGetCursorImage.restype = ctypes.POINTER(Img)
+        xf.XFixesGetCursorImage.argtypes = [ctypes.c_void_p]
+        x11.XFree.argtypes = [ctypes.c_void_p]
+        dpy = x11.XOpenDisplay(None)
+        if not dpy:
+            return
+    except OSError as e:
+        print("cursor sync unavailable:", e, file=sys.stderr)
+        return
+    last = None
+    while True:
+        time.sleep(0.05)
+        try:
+            img = xf.XFixesGetCursorImage(dpy)
+            if not img:
+                continue
+            name = (img.contents.name or b"").decode("latin-1").lower()
+            x11.XFree(img)
+            css = CURSOR_CSS.get(name, "default")
+            if css != last:
+                last, CURSOR["css"] = css, css
+                on_change(css)
+        except Exception as e:
+            print("cursor watcher error:", e, file=sys.stderr)
+            time.sleep(1)
+
+
 # ---------------------------------------------------------------- WebRTC session (GStreamer)
 import gi
 gi.require_version("Gst", "1.0")
@@ -152,7 +213,7 @@ class Session:
         self.ws, self.loop, self.cfg, self.inp = ws, loop, cfg, inp
         fps = cfg["fps"]
         self.pipe = Gst.parse_launch(
-            f"ximagesrc use-damage=false show-pointer=true do-timestamp=true ! "
+            f"ximagesrc use-damage=false show-pointer=false do-timestamp=true ! "
             f"video/x-raw,framerate={fps}/1 ! videoconvert n-threads=2 ! video/x-raw,format=I420 ! queue max-size-buffers=2 leaky=downstream ! "
             f"x264enc name=enc tune=zerolatency speed-preset=ultrafast bitrate={cfg['bitrate_kbps']} "
             f"key-int-max={fps*2} bframes=0 threads=4 sliced-threads=true vbv-buf-capacity=300 ! "
@@ -236,7 +297,7 @@ class WsSession:
         self.pending, self.need_key, self.closed = 0, True, False
         fps = min(cfg["fps"], 30)
         self.pipe = Gst.parse_launch(
-            f"ximagesrc use-damage=false show-pointer=true do-timestamp=true ! "
+            f"ximagesrc use-damage=false show-pointer=false do-timestamp=true ! "
             f"video/x-raw,framerate={fps}/1 ! videoconvert n-threads=2 ! video/x-raw,format=I420 ! queue max-size-buffers=2 leaky=downstream ! "
             f"x264enc name=enc tune=zerolatency speed-preset=ultrafast bitrate=4000 "
             f"key-int-max={fps*2} bframes=0 threads=4 sliced-threads=true vbv-buf-capacity=300 ! "
@@ -362,6 +423,7 @@ async def ws_handler(req):
                                     "ice_servers": cfg["ice_servers"], "w": inp.w, "h": inp.h})
                 cls = WsSession if m.get("mode") == "ws" else Session
                 sess = ACTIVE["s"] = cls(ws, loop, cfg, inp)
+                await ws.send_json({"type": "cursor", "css": CURSOR["css"]})
             elif m["type"] == "answer" and isinstance(sess, Session):
                 sess.on_answer(m["sdp"])
             elif m["type"] == "ice" and isinstance(sess, Session):
@@ -376,7 +438,14 @@ async def ws_handler(req):
     return ws
 
 
+def push_cursor(css):
+    sess = ACTIVE["s"]
+    if sess:
+        asyncio.run_coroutine_threadsafe(sess.ws.send_json({"type": "cursor", "css": css}), sess.loop)
+
+
 def make_app(cfg):
+    threading.Thread(target=cursor_watcher, args=(push_cursor,), daemon=True).start()
     app = web.Application()
     app["cfg"], app["inp"] = cfg, Input()
     app.add_routes([web.get("/", index), web.get("/login", login_page), web.post("/api/login", login),
