@@ -4,6 +4,7 @@ Control your Linux desktop from **any browser, on any network**, with a username
 Think of a self-hosted NoMachine / AnyDesk that is just a small Python service plus a web page.
 
 - **Smooth, low latency**: your screen is encoded to H.264 and sent over **WebRTC**; mouse and keyboard go back over WebRTC data channels.
+- **Adapts to bad internet**: the viewer reports loss and round-trip time every second; the server lowers bitrate and resolution (1080p → 720p → 540p) when the link struggles and raises them again when it recovers. Packet loss is repaired with NACK/RTX retransmits and gradual intra refresh (no big key-frame bursts).
 - **Works from anywhere**: the machine only makes *outgoing* connections. No router setup, no port forwarding.
 - **Automatic fallback**: if the network blocks WebRTC (strict NAT, campus WiFi), the page switches to *compatibility mode* (H.264 over the HTTPS WebSocket).
 - **Starts by itself**: systemd user services start at boot, restart on failure, and a watchdog repairs the public address.
@@ -71,7 +72,8 @@ Tailscale runs in user space (no sudo, no kernel changes). Viewers install nothi
 ## Using it
 
 - Open the address, sign in, and the desktop appears. Click the video to give it keyboard focus.
-- Toolbar: quality (3 / 8 / 15 Mbps), connection mode (Auto / Direct only / Compatibility), fullscreen, log out.
+- The toolbar shows live stats: `resolution · fps · Mbps · round-trip ms · % loss`.
+- Toolbar: maximum quality (3 / 8 / 15 Mbps; the picture adapts below that automatically), connection mode (Auto / Direct only / Compatibility), fullscreen, log out.
 - The mouse pointer is drawn by your own browser (zero lag, never disappears); its shape (arrow, text, hand, resize…) follows the remote machine.
 - Only one viewer at a time; a new viewer replaces the old one.
 - Add another login: `python3 ~/.local/share/nmrd/server.py adduser NAME`

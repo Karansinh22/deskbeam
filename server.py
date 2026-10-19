@@ -208,22 +208,69 @@ Gst.init(None)
 threading.Thread(target=GLib.MainLoop().run, daemon=True).start()
 
 
+def capture_chain(w, h, fps):
+    """Screen capture -> I420 at WxH. Only changed screen regions are copied (XDamage).
+    (Jetson's nvvidconv was tried for the colour conversion but it corrupts the picture when the size changes at run time.)"""
+    return (f"ximagesrc use-damage=true show-pointer=false do-timestamp=true ! video/x-raw,framerate={fps}/1 ! "
+            f"videoconvert n-threads=2 ! videoscale n-threads=2 ! capsfilter name=scale caps=video/x-raw,format=I420,width={w},height={h} ! "
+            f"queue max-size-buffers=2 leaky=downstream ! ")
+
+
+class Adapt:
+    """Adjust bitrate and resolution to the link. `max_kbps` is the user's quality ceiling."""
+    LEVELS = ((4000, None), (1800, 1280), (0, 960))      # (min kbps, target width) – best first
+
+    def __init__(self, enc, scale, native, max_kbps, start=3000):
+        self.enc, self.scale, (self.nw, self.nh) = enc, scale, native
+        self.max, self.cur, self.slow, self.clean, self.base, self.level = max_kbps, min(max_kbps, start), False, 0, None, 0
+        self.last = {}
+        self.apply(force=True)
+
+    def set_max(self, kbps):
+        self.max = max(500, min(30000, int(kbps)))
+        self.cur = min(self.cur, self.max)
+        self.apply()
+
+    def update(self, loss=0.0, rtt=0.0, extra=False):
+        if rtt > 0:                            # remember the best (uncongested) round trip; creep up slowly if the path really got longer
+            self.base = rtt if self.base is None or rtt < self.base else self.base + (rtt - self.base) * 0.02
+        congested = loss > 0.03 or extra or (rtt > 0 and self.base is not None and rtt > self.base * 2 + 60)
+        if congested:
+            self.cur, self.clean, self.slow = max(500, self.cur * 0.72), 0, True
+        else:
+            self.clean += 1
+            if self.clean >= 3:
+                self.cur = min(self.max, self.cur * (1.08 if self.slow else 1.25) + 50)
+        self.apply()
+
+    def apply(self, force=False):
+        self.enc.set_property("bitrate", int(self.cur))
+        if os.environ.get("NMRD_DEBUG"):
+            print(f"adapt: {int(self.cur)} kbps (max {self.max}) level {self.level} base_rtt {self.base}", flush=True)
+        want = next(i for i, (k, _) in enumerate(self.LEVELS) if self.cur >= k * (1.25 if i < self.level else 1))
+        if want != self.level or force:
+            self.level = want
+            tw = self.LEVELS[want][1]
+            w, h = (self.nw, self.nh) if not tw or tw >= self.nw else (tw, round(tw * self.nh / self.nw / 2) * 2)
+            self.scale.set_property("caps", Gst.Caps.from_string(f"video/x-raw,format=I420,width={w},height={h}"))
+
+
 class Session:
     def __init__(self, ws, loop, cfg, inp):
         self.ws, self.loop, self.cfg, self.inp = ws, loop, cfg, inp
         fps = cfg["fps"]
         self.pipe = Gst.parse_launch(
-            f"ximagesrc use-damage=false show-pointer=false do-timestamp=true ! "
-            f"video/x-raw,framerate={fps}/1 ! videoconvert n-threads=2 ! video/x-raw,format=I420 ! queue max-size-buffers=2 leaky=downstream ! "
-            f"x264enc name=enc tune=zerolatency speed-preset=ultrafast bitrate={cfg['bitrate_kbps']} "
+            capture_chain(inp.w, inp.h, fps) +
+            f"x264enc name=enc tune=zerolatency speed-preset=ultrafast bitrate=3000 intra-refresh=true "
             f"key-int-max={fps*2} bframes=0 threads=4 sliced-threads=true vbv-buf-capacity=300 ! "
-            f"video/x-h264,profile=constrained-baseline ! h264parse config-interval=-1 ! "
-            f"rtph264pay config-interval=-1 aggregate-mode=zero-latency pt=96 ! "
+            f"video/x-h264,profile=constrained-baseline ! h264parse config-interval=1 ! "
+            f"rtph264pay config-interval=1 aggregate-mode=zero-latency pt=96 ! "
             f"application/x-rtp,media=video,encoding-name=H264,payload=96 ! "
             f"webrtcbin name=wb bundle-policy=max-bundle latency=0"
         )
         self.wb = self.pipe.get_by_name("wb")
         self.enc = self.pipe.get_by_name("enc")
+        self.adapt = Adapt(self.enc, self.pipe.get_by_name("scale"), (inp.w, inp.h), cfg["bitrate_kbps"])
         self.wb.connect("on-negotiation-needed", self.on_negotiation)
         self.wb.connect("on-ice-candidate", self.on_ice)
         for s in cfg["ice_servers"]:
@@ -246,6 +293,10 @@ class Session:
         asyncio.run_coroutine_threadsafe(self.ws.send_json(obj), self.loop)
 
     def on_negotiation(self, wb):
+        try:                                   # ask the browser for NACK retransmits; PLI -> instant key frame is automatic
+            wb.emit("get-transceiver", 0).set_property("do-nack", True)
+        except Exception as e:
+            print("nack setup:", e, file=sys.stderr)
         p = Gst.Promise.new_with_change_func(self._offer_ready, wb, None)
         wb.emit("create-offer", None, p)
 
@@ -279,10 +330,16 @@ class Session:
             print("input error:", e, file=sys.stderr)
 
     def handle_input(self, m):
-        if m.get("t") == "q":  # quality change
-            self.enc.set_property("bitrate", max(500, min(30000, int(m["kbps"]))))
+        t = m.get("t")
+        if t == "q":                           # user's quality ceiling
+            self.adapt.set_max(m["kbps"])
+        elif t == "st":                        # link stats reported by the browser once a second
+            self.adapt.update(float(m.get("loss", 0)), float(m.get("rtt", 0)), self.congested())
         else:
             self.inp.handle(m)
+
+    def congested(self):
+        return False
 
     def close(self):
         self.inp.handle({"t": "ra"})
@@ -295,16 +352,17 @@ class WsSession:
     def __init__(self, ws, loop, cfg, inp):
         self.ws, self.loop, self.inp = ws, loop, inp
         self.pending, self.need_key, self.closed = 0, True, False
+        self.drops = 0
         fps = min(cfg["fps"], 30)
         self.pipe = Gst.parse_launch(
-            f"ximagesrc use-damage=false show-pointer=false do-timestamp=true ! "
-            f"video/x-raw,framerate={fps}/1 ! videoconvert n-threads=2 ! video/x-raw,format=I420 ! queue max-size-buffers=2 leaky=downstream ! "
-            f"x264enc name=enc tune=zerolatency speed-preset=ultrafast bitrate=4000 "
+            capture_chain(inp.w, inp.h, fps) +
+            f"x264enc name=enc tune=zerolatency speed-preset=ultrafast bitrate=3000 "
             f"key-int-max={fps*2} bframes=0 threads=4 sliced-threads=true vbv-buf-capacity=300 ! "
             f"video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au ! "
             f"appsink name=sink emit-signals=true sync=false max-buffers=2 drop=true"
         )
         self.enc = self.pipe.get_by_name("enc")
+        self.adapt = Adapt(self.enc, self.pipe.get_by_name("scale"), (inp.w, inp.h), min(cfg["bitrate_kbps"], 6000))
         self.pipe.get_by_name("sink").connect("new-sample", self.on_sample)
         self.pipe.set_state(Gst.State.PLAYING)
 
@@ -316,6 +374,7 @@ class WsSession:
             return Gst.FlowReturn.OK
         if self.pending > 3 and not key:       # link is slower than the video: drop, resync on next key frame
             self.need_key = True
+            self.drops += 1
             return Gst.FlowReturn.OK
         if self.need_key and not key:
             return Gst.FlowReturn.OK
@@ -330,10 +389,17 @@ class WsSession:
         return Gst.FlowReturn.OK
 
     def handle_input(self, m):
-        if m.get("t") == "q":
-            self.enc.set_property("bitrate", max(500, min(30000, int(m["kbps"]))))
+        t = m.get("t")
+        if t == "q":                           # user's quality ceiling
+            self.adapt.set_max(m["kbps"])
+        elif t == "st":                        # link stats reported by the browser once a second
+            self.adapt.update(float(m.get("loss", 0)), float(m.get("rtt", 0)), self.congested())
         else:
             self.inp.handle(m)
+
+    def congested(self):                       # frames were dropped because the link couldn't keep up
+        d, self.drops = self.drops, 0
+        return d > 0
 
     def close(self):
         self.closed = True
@@ -494,6 +560,8 @@ async def ws_handler(req):
                 sess.on_answer(m["sdp"])
             elif m["type"] == "ice" and isinstance(sess, Session):
                 sess.on_remote_ice(m["mline"], m["candidate"])
+            elif m["type"] == "ping":
+                await ws.send_json({"type": "pong", "ts": m["ts"]})
             elif m["type"] == "in" and sess:
                 sess.handle_input(m["m"])
     finally:

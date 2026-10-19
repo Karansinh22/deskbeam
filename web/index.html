@@ -5,17 +5,17 @@
 *{box-sizing:border-box}html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif;overflow:hidden}
 #bar{position:fixed;top:0;left:0;right:0;height:38px;display:flex;gap:10px;align-items:center;padding:0 12px;background:var(--bar);z-index:2;transition:transform .2s}
 #bar.hide{transform:translateY(-100%)}
-#st{margin-right:auto}select,button{background:var(--bg);color:var(--fg);border:1px solid #333;border-radius:6px;padding:4px 8px;font:inherit;cursor:pointer}
+#st{margin-right:0}#hud{margin-right:auto;opacity:.75;font-variant-numeric:tabular-nums;font-size:12px;white-space:nowrap;overflow:hidden}select,button{background:var(--bg);color:var(--fg);border:1px solid #333;border-radius:6px;padding:4px 8px;font:inherit;cursor:pointer}
 #v,#cv{position:fixed;top:38px;left:0;right:0;bottom:0;width:100%;height:calc(100% - 38px);object-fit:contain;background:#000;cursor:default;outline:none}
 #cv{display:none}
 body.fs #v,body.fs #cv{top:0;height:100%}
 </style></head><body>
-<div id="bar"><span id="st">Connecting…</span>
-<select id="q" title="Quality (bitrate)"><option value="3000">Low 3 Mbps</option><option value="8000" selected>Good 8 Mbps</option><option value="15000">High 15 Mbps</option></select>
+<div id="bar"><span id="st">Connecting…</span><span id="hud" title="Resolution · frames/s · bitrate · round-trip · packet loss"></span>
+<select id="q" title="Maximum quality. The picture adapts automatically to your connection."><option value="3000">Max 3 Mbps</option><option value="8000" selected>Max 8 Mbps</option><option value="15000">Max 15 Mbps</option></select>
 <select id="mode" title="Connection mode"><option value="auto">Auto</option><option value="webrtc">Direct only</option><option value="ws">Compatibility</option></select><button id="fs">Fullscreen</button><button id="lo">Log out</button></div>
 <video id="v" autoplay muted playsinline tabindex="0"></video><canvas id="cv" tabindex="0"></canvas>
 <script>
-const $=id=>document.getElementById(id);let pc,ws,ch={},cfg,mode,dec,fallbackTimer,gotKey=false,ts=0,paused=false;
+const $=id=>document.getElementById(id);let wsFrames=0,wsBytes=0,wsRtt=0,prev=null,pc,ws,ch={},cfg,mode,dec,fallbackTimer,gotKey=false,ts=0,paused=false;
 const st=t=>$("st").textContent=t;
 const v=$("v"),cv=$("cv"),ctx=cv.getContext("2d");
 function send(c,o){
@@ -26,7 +26,7 @@ $("mode").value=pref();
 $("mode").onchange=e=>{try{localStorage.setItem("nmrd-mode",e.target.value)}catch(_){}ws&&ws.close()};
 function show(m){v.style.display=m==="webrtc"?"block":"none";cv.style.display=m==="ws"?"block":"none";}
 function begin(m){
-  mode=m;clearTimeout(fallbackTimer);gotKey=false;
+  mode=m;clearTimeout(fallbackTimer);gotKey=false;prev=null;wsFrames=wsBytes=0;
   if(pc){pc.close();pc=null}if(dec){try{dec.close()}catch(_){}dec=null}ch={};show(m);
   if(m==="ws"&&!window.VideoDecoder){st("This browser lacks WebCodecs – use Chrome/Edge/Firefox");return}
   ws.send(JSON.stringify({type:"start",mode:m}));
@@ -42,6 +42,7 @@ function connect(){
   ws.onmessage=async e=>{
     if(e.data instanceof ArrayBuffer){return frame(new Uint8Array(e.data))}
     const m=JSON.parse(e.data);
+    if(m.type==="pong"){wsRtt=performance.now()-m.ts;return}
     if(m.type==="paused"){paused=true;st("Remote access is paused by the owner");return}
     if(m.type==="cursor"){v.style.cursor=cv.style.cursor=m.css;return}
     if(m.type==="config"){cfg=m;
@@ -58,12 +59,35 @@ function connect(){
     else if(m.type==="ice"&&pc){pc.addIceCandidate({candidate:m.candidate,sdpMLineIndex:m.mline}).catch(()=>{});}
   };
 }
+// ---- link statistics: shown in the toolbar and sent to the server, which adapts bitrate/resolution
+async function collect(){
+  const now=performance.now();let o=null;
+  if(mode==="ws"){
+    if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:"ping",ts:now}));
+    const dt=prev&&prev.t?(now-prev.t)/1000:1;
+    o={w:cv.width,h:cv.height,fps:Math.round((wsFrames-(prev?.f||0))/dt),kbps:Math.round((wsBytes-(prev?.b||0))*8/1000/dt),rtt:Math.round(wsRtt),loss:0};
+    prev={t:now,f:wsFrames,b:wsBytes};
+  }else if(pc&&pc.connectionState==="connected"){
+    let inb=null,pair=null;
+    (await pc.getStats()).forEach(r=>{if(r.type==="inbound-rtp"&&r.kind==="video")inb=r;
+      if(r.type==="candidate-pair"&&(r.nominated||r.selected)&&r.state==="succeeded")pair=r});
+    if(inb){const p=prev||{},dt=p.t?(now-p.t)/1000:1,dl=inb.packetsLost-(p.l||0),dr=inb.packetsReceived-(p.r||0);
+      o={w:inb.frameWidth,h:inb.frameHeight,fps:Math.round(inb.framesPerSecond||0),kbps:Math.round((inb.bytesReceived-(p.b||0))*8/1000/dt),
+         rtt:pair&&pair.currentRoundTripTime?Math.round(pair.currentRoundTripTime*1000):0,loss:dr+dl>0?Math.max(0,dl)/(dr+Math.max(0,dl)):0};
+      prev={t:now,l:inb.packetsLost,r:inb.packetsReceived,b:inb.bytesReceived};}
+  }
+  if(o&&o.w){$("hud").textContent=`${o.w}×${o.h} · ${o.fps} fps · ${(o.kbps/1000).toFixed(1)} Mbps · ${o.rtt} ms · ${(o.loss*100).toFixed(1)}% loss`;
+    send("key",{t:"st",loss:o.loss,rtt:o.rtt,fps:o.fps,kbps:o.kbps});}
+  else $("hud").textContent="";
+}
+setInterval(()=>{collect().catch(()=>{})},1000);
 function setupDecoder(){
   dec=new VideoDecoder({output:f=>{if(cv.width!==f.displayWidth||cv.height!==f.displayHeight){cv.width=f.displayWidth;cv.height=f.displayHeight}
       ctx.drawImage(f,0,0);f.close()},error:e=>{console.warn(e);st("Decoder error – reconnecting");ws.close()}});
   dec.configure({codec:"avc1.42C028",optimizeForLatency:true});
 }
 function frame(b){
+  wsFrames++;wsBytes+=b.length;
   if(!dec||dec.state!=="configured")return;
   const key=b[0]===1;if(!gotKey&&!key)return;gotKey=true;
   if(dec.decodeQueueSize>4&&!key)return;            // decoder behind: skip delta frames
