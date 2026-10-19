@@ -66,29 +66,53 @@ class Overlay(Gtk.Window):
         self.add(box)
         self.paused = False
         self.state = None
-        geo = Gdk.Display.get_default().get_primary_monitor().get_geometry()
+        geo = self.screen_box()
         self.right, self.top, self._lock = geo.x + geo.width - 20, geo.y + 52, True
         self.connect("configure-event", self.on_configure)
         self.show_all()
         self.place()
+        GLib.timeout_add(1000, self.keep_visible)
         GLib.timeout_add(1000, self.poll)
         GLib.timeout_add(1000, self.tick)
 
+    def screen_box(self, x=None, y=None):
+        """Geometry of the monitor the panel is on (primary if unknown)."""
+        disp = Gdk.Display.get_default()
+        mon = disp.get_monitor_at_point(x, y) if x is not None else None
+        return (mon or disp.get_primary_monitor() or disp.get_monitor(0)).get_geometry()
+
+    def clamp(self, x, y, w, h):
+        g = self.screen_box(x + w // 2, y)
+        return (max(g.x, min(x, g.x + g.width - w)), max(g.y + 32, min(y, g.y + g.height - h - 8)))
+
     def place(self):
-        """Anchor: right edge + top. Window grows/shrinks leftwards, so it never runs off the screen."""
-        w = self.get_preferred_width()[1]
+        """Anchor: right edge + top. Window grows/shrinks leftwards and is always clamped onto the screen."""
+        w, h = self.get_preferred_width()[1], self.get_preferred_height()[1]
         self._lock = True
         self.resize(1, 1)
-        self.move(self.right - w, self.top)
+        x, y = self.clamp(self.right - w, self.top, w, h)
+        self.right, self.top = x + w, y
+        self.move(x, y)
         GLib.timeout_add(300, self._unlock)
+
+    def keep_visible(self):
+        """Safety net: if the panel ever ends up off-screen (drag, monitor change), pull it back."""
+        if not self._lock:
+            x, y = self.get_position(); w, h = self.get_size()
+            nx, ny = self.clamp(x, y, w, h)
+            if (nx, ny) != (x, y):
+                self.right, self.top = nx + w, ny
+                self.move(nx, ny)
+        return True
 
     def _unlock(self):
         self._lock = False
         return False
 
     def on_configure(self, win, ev):
-        if not self._lock:                      # user dragged it: remember the new anchor
-            self.right, self.top = ev.x + ev.width, ev.y
+        if not self._lock:                      # user dragged it: remember the new anchor (kept on-screen)
+            x, y = self.clamp(ev.x, ev.y, ev.width, ev.height)
+            self.right, self.top = x + ev.width, y
 
     def set_collapsed(self, value):
         self.collapsed = value
