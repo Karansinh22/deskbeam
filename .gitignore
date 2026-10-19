@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+*.key
+*.pem
+users.json
+config.json
+ntfy_topic
+url.txt
+stable_url
+quick_url.txt
+cloudflared
+tailscale/
+.vscode/
