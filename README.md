@@ -1,7 +1,9 @@
-# nmrd – web remote desktop for Linux (free, low latency)
+# DeskBeam – web remote desktop for Linux (free, low latency)
+
+> Technical name used for files, services and config: **`nmrd`**.
 
 Control your Linux desktop from **any browser, on any network**, with a username and password you choose.
-Think of a self-hosted NoMachine / AnyDesk that is just a small Python service plus a web page.
+DeskBeam is a self-hosted alternative to NoMachine / AnyDesk: a small Python service plus a web page.
 
 - **Smooth, low latency**: your screen is encoded to H.264 and sent over **WebRTC**; mouse and keyboard go back over WebRTC data channels.
 - **Adapts to bad internet**: the viewer reports loss and round-trip time every second; the server lowers bitrate and resolution (1080p → 720p → 540p) when the link struggles and raises them again when it recovers. Packet loss is repaired with NACK/RTX retransmits and gradual intra refresh (no big key-frame bursts).
@@ -41,8 +43,8 @@ sudo apt install -y python3-aiohttp python3-bcrypt python3-xlib python3-gi gir1.
 ## Install
 
 ```bash
-git clone https://github.com/Karansinh22/nmrd-remote-desktop.git
-cd nmrd-remote-desktop
+git clone https://github.com/Karansinh22/deskbeam.git
+cd deskbeam
 ./install.sh
 ```
 

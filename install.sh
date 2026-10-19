@@ -38,7 +38,7 @@ fi
 echo "== Auto-start (systemd user services: start at boot, restart forever)"
 cat > "$UNITS/nmrd.service" <<UNIT
 [Unit]
-Description=nmrd remote desktop server
+Description=DeskBeam (nmrd) server
 StartLimitIntervalSec=0
 [Service]
 Environment=DISPLAY=:0
