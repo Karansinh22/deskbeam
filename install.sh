@@ -10,11 +10,11 @@ mkdir -p "$DEST" "$CONF" "$UNITS"
 if [ -r "/run/user/$(id -u)/gdm/Xauthority" ]; then XAUTH="/run/user/$(id -u)/gdm/Xauthority"; else XAUTH="$HOME/.Xauthority"; fi
 
 echo "== Dependencies"
-python3 -c "import aiohttp, bcrypt, Xlib, gi" 2>/dev/null || { echo "Missing: sudo apt install -y python3-aiohttp python3-bcrypt python3-xlib gstreamer1.0-nice"; exit 1; }
+python3 -c "import aiohttp, bcrypt, Xlib, gi; gi.require_version('Gtk','3.0'); from gi.repository import Gtk" 2>/dev/null || { echo "Missing: sudo apt install -y python3-aiohttp python3-bcrypt python3-xlib gstreamer1.0-nice gir1.2-gtk-3.0"; exit 1; }
 gst-inspect-1.0 nicesrc >/dev/null 2>&1 || { echo "Missing: sudo apt install -y gstreamer1.0-nice"; exit 1; }
 
 echo "== Copying files"
-cp -r "$SRC/server.py" "$SRC/web" "$SRC/tunnel.sh" "$SRC/tailscale-setup.sh" "$SRC/watchdog.sh" "$DEST/"
+cp -r "$SRC/server.py" "$SRC/web" "$SRC/tunnel.sh" "$SRC/tailscale-setup.sh" "$SRC/watchdog.sh" "$SRC/overlay.py" "$DEST/"
 chmod +x "$DEST/tunnel.sh" "$DEST/tailscale-setup.sh" "$DEST/watchdog.sh"
 
 if [ -s "$CONF/users.json" ]; then
@@ -64,6 +64,22 @@ RestartSec=5
 [Install]
 WantedBy=default.target
 UNIT
+cat > "$UNITS/nmrd-overlay.service" <<UNIT
+[Unit]
+Description=nmrd desktop overlay (who is connected, disconnect/pause)
+After=nmrd.service
+StartLimitIntervalSec=0
+[Service]
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=$XAUTH
+ExecStartPre=/bin/sh -c 'until [ -S /tmp/.X11-unix/X0 ] && [ -r "\$XAUTHORITY" ]; do sleep 1; done'
+ExecStart=/usr/bin/python3 $DEST/overlay.py
+Restart=always
+RestartSec=3
+TimeoutStartSec=infinity
+[Install]
+WantedBy=default.target
+UNIT
 cat > "$UNITS/nmrd-watchdog.service" <<UNIT
 [Unit]
 Description=nmrd self-healing watchdog for the public address
@@ -79,8 +95,8 @@ UNIT
 # keep the user service manager running from boot, even before anyone logs in
 loginctl enable-linger "$USER" 2>/dev/null || echo "NOTE: could not enable linger; run: sudo loginctl enable-linger $USER"
 systemctl --user daemon-reload
-systemctl --user enable nmrd.service nmrd-tunnel.service nmrd-watchdog.service
-systemctl --user restart nmrd.service nmrd-tunnel.service nmrd-watchdog.service
+systemctl --user enable nmrd.service nmrd-tunnel.service nmrd-watchdog.service nmrd-overlay.service
+systemctl --user restart nmrd.service nmrd-tunnel.service nmrd-watchdog.service nmrd-overlay.service
 sleep 8
 echo
 echo "Installed. Local address : http://localhost:8080"

@@ -30,7 +30,7 @@ Think of a self-hosted NoMachine / AnyDesk that is just a small Python service p
 ### Install dependencies (Debian/Ubuntu)
 
 ```bash
-sudo apt install -y python3-aiohttp python3-bcrypt python3-xlib python3-gi \
+sudo apt install -y python3-aiohttp python3-bcrypt python3-xlib python3-gi gir1.2-gtk-3.0 libnotify-bin \
   gir1.2-gst-plugins-bad-1.0 gstreamer1.0-tools gstreamer1.0-x gstreamer1.0-nice \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly curl
 ```
@@ -76,6 +76,19 @@ Tailscale runs in user space (no sudo, no kernel changes). Viewers install nothi
 - Only one viewer at a time; a new viewer replaces the old one.
 - Add another login: `python3 ~/.local/share/nmrd/server.py adduser NAME`
   (users live in `~/.config/nmrd/users.json`; delete a user by removing its entry).
+
+## Who is connected? (desktop overlay)
+
+A small floating pill sits at the top-right of the machine's desktop (`overlay.py`, started automatically):
+
+- 🟢 **Remote access on · nobody connected**: idle.
+- 🔴 **`name` is viewing / controlling · IP · mode · time** with a red **Disconnect** button: the viewer is kicked **and their login is revoked**, so they land on the sign-in page.
+- **Pause**: blocks all new viewers (and disconnects the current one) until you press **Resume**.
+- You also get a desktop notification whenever someone connects or disconnects.
+- **Hide / show:** click the coloured dot to collapse the panel to just the dot (it turns red while someone is connected); click it again to expand. The choice is remembered across restarts. You can also toggle from a terminal or a keyboard shortcut with `systemctl --user kill -s USR1 nmrd-overlay`.
+- Drag the panel by its text to move it; stop it entirely with `systemctl --user disable --now nmrd-overlay`.
+
+The overlay talks to the server over `127.0.0.1` using a secret token in `~/.config/nmrd/local_token` (mode 600), so people connecting over the internet can't use these controls. Note that a viewer who controls your desktop can of course click the overlay too.
 
 ## Configuration
 

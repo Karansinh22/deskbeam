@@ -15,7 +15,7 @@ body.fs #v,body.fs #cv{top:0;height:100%}
 <select id="mode" title="Connection mode"><option value="auto">Auto</option><option value="webrtc">Direct only</option><option value="ws">Compatibility</option></select><button id="fs">Fullscreen</button><button id="lo">Log out</button></div>
 <video id="v" autoplay muted playsinline tabindex="0"></video><canvas id="cv" tabindex="0"></canvas>
 <script>
-const $=id=>document.getElementById(id);let pc,ws,ch={},cfg,mode,dec,fallbackTimer,gotKey=false,ts=0;
+const $=id=>document.getElementById(id);let pc,ws,ch={},cfg,mode,dec,fallbackTimer,gotKey=false,ts=0,paused=false;
 const st=t=>$("st").textContent=t;
 const v=$("v"),cv=$("cv"),ctx=cv.getContext("2d");
 function send(c,o){
@@ -34,11 +34,15 @@ function begin(m){
 }
 function connect(){
   ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws");ws.binaryType="arraybuffer";
-  ws.onopen=()=>begin(pref()==="ws"?"ws":"webrtc");
-  ws.onclose=()=>{clearTimeout(fallbackTimer);st("Disconnected – reconnecting…");setTimeout(()=>{pc&&pc.close();connect()},2000)};
+  ws.onopen=()=>{paused=false;begin(pref()==="ws"?"ws":"webrtc")};
+  ws.onclose=()=>{clearTimeout(fallbackTimer);if(!paused)st("Disconnected – reconnecting…");
+    setTimeout(async()=>{pc&&pc.close();
+      try{const r=await fetch("/api/me");if(r.status===401){location.href="/login";return}}catch(_){}
+      connect()},paused?5000:2000)};
   ws.onmessage=async e=>{
     if(e.data instanceof ArrayBuffer){return frame(new Uint8Array(e.data))}
     const m=JSON.parse(e.data);
+    if(m.type==="paused"){paused=true;st("Remote access is paused by the owner");return}
     if(m.type==="cursor"){v.style.cursor=cv.style.cursor=m.css;return}
     if(m.type==="config"){cfg=m;
       if(m.mode==="ws"){setupDecoder();st("Connected (compatibility mode)");return}

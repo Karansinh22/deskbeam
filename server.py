@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """nmrd - tiny remote-desktop server: web login + WebRTC screen + input injection (X11)."""
-import asyncio, getpass, json, os, secrets, sys, threading, time, argparse
+import asyncio, getpass, json, os, secrets, subprocess, sys, threading, time, argparse
 from pathlib import Path
 
 import bcrypt
@@ -342,9 +342,12 @@ class WsSession:
 
 
 # ---------------------------------------------------------------- web app
-SESSIONS = {}          # token -> expiry
+SESSIONS = {}          # token -> (expiry, username)
 FAILS = {}             # ip -> (count, locked_until)
 ACTIVE = {"s": None}   # one viewer at a time
+VIEWER = {"info": None, "ws": None, "token": None}   # who is connected right now (shown by the desktop overlay)
+STATE = {"paused": False}                            # owner switch: refuse all new viewers
+LOCAL_TOKEN = CONF_DIR / "local_token"               # secret shared only with the desktop overlay (same user)
 
 
 def client_ip(req):
@@ -355,8 +358,59 @@ def client_ip(req):
 
 
 def authed(req):
-    exp = SESSIONS.get(req.cookies.get("nmrd"))
-    return bool(exp and exp > time.time())
+    ent = SESSIONS.get(req.cookies.get("nmrd"))
+    return bool(ent and ent[0] > time.time())
+
+
+def session_user(req):
+    return SESSIONS[req.cookies["nmrd"]][1]
+
+
+def notify(title, body):
+    try:
+        subprocess.Popen(["notify-send", "-a", "nmrd", "-u", "critical", title, body],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def local_ok(req):
+    """Owner-only endpoints: need the secret token file readable only by the desktop user."""
+    try:
+        return secrets.compare_digest(req.headers.get("X-Local-Token", ""), LOCAL_TOKEN.read_text().strip())
+    except OSError:
+        return False
+
+
+async def local_status(req):
+    if not local_ok(req):
+        raise web.HTTPForbidden()
+    return web.json_response({"viewer": VIEWER["info"], "paused": STATE["paused"]})
+
+
+async def local_kick(req):
+    if not local_ok(req):
+        raise web.HTTPForbidden()
+    info, ws, tok = VIEWER["info"], VIEWER["ws"], VIEWER["token"]
+    if ws is None:
+        return web.json_response({"ok": True, "kicked": None})
+    SESSIONS.pop(tok, None)               # their login is revoked: they must sign in again
+    await ws.close()
+    return web.json_response({"ok": True, "kicked": info and info["user"]})
+
+
+async def local_pause(req):
+    if not local_ok(req):
+        raise web.HTTPForbidden()
+    STATE["paused"] = bool((await req.json()).get("paused"))
+    if STATE["paused"] and VIEWER["ws"] is not None:
+        SESSIONS.pop(VIEWER["token"], None)
+        await VIEWER["ws"].close()
+    return web.json_response({"ok": True, "paused": STATE["paused"]})
+
+
+async def api_me(req):
+    return web.json_response({"ok": True}) if authed(req) else web.json_response({"ok": False}, status=401)
 
 
 async def index(req):
@@ -383,7 +437,7 @@ async def login(req):
         return web.json_response({"error": "Wrong username or password."}, status=401)
     FAILS.pop(ip, None)
     tok = secrets.token_urlsafe(32)
-    SESSIONS[tok] = time.time() + 12 * 3600
+    SESSIONS[tok] = (time.time() + 12 * 3600, str(data.get('user')))
     r = web.json_response({"ok": True})
     r.set_cookie("nmrd", tok, httponly=True, samesite="Strict", max_age=12 * 3600,
                  secure=req.headers.get("X-Forwarded-Proto", req.scheme) == "https")
@@ -405,7 +459,13 @@ async def ws_handler(req):
         raise web.HTTPForbidden()
     ws = web.WebSocketResponse(heartbeat=15)
     await ws.prepare(req)
+    if STATE["paused"]:
+        await ws.send_json({"type": "paused"})
+        await ws.close()
+        return ws
     cfg, loop = req.app["cfg"], asyncio.get_running_loop()
+    me = {"user": session_user(req), "ip": client_ip(req), "mode": None, "since": int(time.time()),
+          "agent": req.headers.get("User-Agent", "")[:120]}
     if ACTIVE["s"]:                      # newest viewer wins
         ACTIVE["s"].close()
         ACTIVE["s"] = None
@@ -423,6 +483,12 @@ async def ws_handler(req):
                                     "ice_servers": cfg["ice_servers"], "w": inp.w, "h": inp.h})
                 cls = WsSession if m.get("mode") == "ws" else Session
                 sess = ACTIVE["s"] = cls(ws, loop, cfg, inp)
+                first = VIEWER["ws"] is not ws
+                me["mode"] = "compatibility" if m.get("mode") == "ws" else "direct"
+                if first:
+                    me["since"] = int(time.time())
+                    notify("Remote viewer connected", f"{me['user']} from {me['ip']}")
+                VIEWER.update(info=me, ws=ws, token=req.cookies.get("nmrd"))
                 await ws.send_json({"type": "cursor", "css": CURSOR["css"]})
             elif m["type"] == "answer" and isinstance(sess, Session):
                 sess.on_answer(m["sdp"])
@@ -435,6 +501,9 @@ async def ws_handler(req):
             sess.close()
             if ACTIVE["s"] is sess:
                 ACTIVE["s"] = None
+        if VIEWER["ws"] is ws:
+            VIEWER.update(info=None, ws=None, token=None)
+            notify("Remote viewer disconnected", me["user"])
     return ws
 
 
@@ -449,7 +518,9 @@ def make_app(cfg):
     app = web.Application()
     app["cfg"], app["inp"] = cfg, Input()
     app.add_routes([web.get("/", index), web.get("/login", login_page), web.post("/api/login", login),
-                    web.post("/api/logout", logout), web.get("/ws", ws_handler)])
+                    web.post("/api/logout", logout), web.get("/api/me", api_me), web.get("/ws", ws_handler),
+                    web.get("/local/status", local_status), web.post("/local/kick", local_kick),
+                    web.post("/local/pause", local_pause)])
     return app
 
 
@@ -475,6 +546,10 @@ def main():
         cfg["port"] = args.port or cfg["port"]
     if not load_users():
         sys.exit("No users yet. Run: server.py adduser <name>")
+    if not LOCAL_TOKEN.exists():
+        CONF_DIR.mkdir(parents=True, exist_ok=True)
+        LOCAL_TOKEN.write_text(secrets.token_urlsafe(32))
+        LOCAL_TOKEN.chmod(0o600)
     web.run_app(make_app(cfg), host=cfg["bind"], port=cfg["port"], print=lambda *_: print(f"nmrd listening on {cfg['bind']}:{cfg['port']}", flush=True))
 
 
