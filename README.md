@@ -76,7 +76,7 @@ Tailscale runs in user space (no sudo, no kernel changes). Viewers install nothi
 - Open the address, sign in, and the desktop appears. Click the video to give it keyboard focus.
 - The toolbar shows live stats: `resolution · fps · Mbps · round-trip ms · % loss`.
 - Toolbar: maximum quality (3 / 8 / 15 Mbps; the picture adapts below that automatically), connection mode (Auto / Direct only / Compatibility), fullscreen, log out.
-- The mouse pointer is drawn by your own browser (zero lag, never disappears); its shape (arrow, text, hand, resize…) follows the remote machine.
+- The mouse pointer is drawn by your own browser (zero lag, never disappears); its real shape (arrow, text, hand, resize, app-specific cursors) is copied from the remote machine and clicks carry their own position, so the click lands exactly where the pointer is.
 - Only one viewer at a time; a new viewer replaces the old one.
 - Add another login: `python3 ~/.local/share/nmrd/server.py adduser NAME`
   (users live in `~/.config/nmrd/users.json`; delete a user by removing its entry).

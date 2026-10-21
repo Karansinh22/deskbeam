@@ -44,7 +44,7 @@ function connect(){
     const m=JSON.parse(e.data);
     if(m.type==="pong"){wsRtt=performance.now()-m.ts;return}
     if(m.type==="paused"){paused=true;st("Remote access is paused by the owner");return}
-    if(m.type==="cursor"){v.style.cursor=cv.style.cursor=m.css;return}
+    if(m.type==="cursor"){const c=m.img?`url(${m.img}) ${m.hx} ${m.hy}, ${m.css}`:m.css;v.style.cursor=cv.style.cursor=c;return}
     if(m.type==="config"){cfg=m;
       if(m.mode==="ws"){setupDecoder();st("Connected (compatibility mode)");return}
       pc=new RTCPeerConnection({iceServers:m.ice_servers,bundlePolicy:"max-bundle"});
@@ -101,10 +101,10 @@ let mvPending=null;                                  // coalesce mouse moves to 
 function queueMove(e){const first=!mvPending;mvPending=pos(e);if(first)requestAnimationFrame(()=>{send("mouse",{t:"mv",...mvPending});mvPending=null})}
 for(const t of [v,cv]){
   t.addEventListener("pointermove",queueMove);
-  t.addEventListener("pointerdown",e=>{t.focus();t.setPointerCapture(e.pointerId);send("mouse",{t:"mv",...pos(e)});send("key",{t:"md",b:e.button});e.preventDefault()});
-  t.addEventListener("pointerup",e=>{send("key",{t:"mu",b:e.button});e.preventDefault()});
+  t.addEventListener("pointerdown",e=>{t.focus();t.setPointerCapture(e.pointerId);send("key",{t:"md",b:e.button,...pos(e)});e.preventDefault()});
+  t.addEventListener("pointerup",e=>{send("key",{t:"mu",b:e.button,...pos(e)});e.preventDefault()});
   t.addEventListener("contextmenu",e=>e.preventDefault());
-  t.addEventListener("wheel",e=>{send("key",{t:"wh",n:Math.sign(e.deltaY)*Math.min(5,Math.ceil(Math.abs(e.deltaY)/60))});e.preventDefault()},{passive:false});
+  t.addEventListener("wheel",e=>{send("key",{t:"wh",n:Math.sign(e.deltaY)*Math.min(5,Math.ceil(Math.abs(e.deltaY)/60)),...pos(e)});e.preventDefault()},{passive:false});
   t.addEventListener("keydown",e=>{send("key",{t:"kd",k:e.key,c:e.code});e.preventDefault()});
   t.addEventListener("keyup",e=>{send("key",{t:"ku",k:e.key,c:e.code});e.preventDefault()});
   t.addEventListener("blur",()=>send("key",{t:"ra"}));

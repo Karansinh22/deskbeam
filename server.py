@@ -77,6 +77,7 @@ class Input:
         self.root = self.d.screen().root
         g = self.root.get_geometry()
         self.w, self.h = g.width, g.height
+        self._geo_at = time.monotonic()
         self.down = set()
 
     def _keycode(self, key, code):
@@ -105,17 +106,29 @@ class Input:
                 except Exception as e2:
                     print("X reconnect failed:", e2, file=sys.stderr)
 
+    def _move(self, m):
+        x = min(self.w - 1, max(0, int(m["x"] * self.w)))
+        y = min(self.h - 1, max(0, int(m["y"] * self.h)))
+        self.xtest.fake_input(self.d, self.X.MotionNotify, x=x, y=y)
+
     def _handle(self, m):
         X, t = self.X, m.get("t")
         with self.lock:
+            now = time.monotonic()
+            if now - self._geo_at > 2:                       # screen resolution can change after start-up
+                g = self.root.get_geometry()
+                self.w, self.h, self._geo_at = g.width, g.height, now
             if t == "mv":
-                x, y = int(m["x"] * self.w), int(m["y"] * self.h)
-                self.xtest.fake_input(self.d, X.MotionNotify, x=x, y=y)
+                self._move(m)
             elif t in ("md", "mu"):
+                if "x" in m:                                 # click carries its own position: the separate (unreliable)
+                    self._move(m)                            # move channel may be late, which made clicks land off-target
                 b = {0: 1, 1: 2, 2: 3}.get(m["b"])
                 if b:
                     self.xtest.fake_input(self.d, X.ButtonPress if t == "md" else X.ButtonRelease, b)
             elif t == "wh":
+                if "x" in m:
+                    self._move(m)
                 for _ in range(min(abs(int(m["n"])), 10)):
                     b = 4 if m["n"] < 0 else 5
                     self.xtest.fake_input(self.d, X.ButtonPress, b)
@@ -153,21 +166,31 @@ CURSOR_CSS = {
     "not-allowed": "not-allowed", "crossed_circle": "not-allowed", "forbidden": "not-allowed", "no-drop": "no-drop",
     "grab": "grab", "openhand": "grab", "grabbing": "grabbing", "closedhand": "grabbing", "dnd-none": "grabbing",
     "copy": "copy", "dnd-copy": "copy", "alias": "alias", "dnd-link": "alias", "context-menu": "context-menu",
+    "n-resize": "n-resize", "s-resize": "s-resize", "e-resize": "e-resize", "w-resize": "w-resize",
+    "ne-resize": "ne-resize", "nw-resize": "nw-resize", "se-resize": "se-resize", "sw-resize": "sw-resize",
     "zoom-in": "zoom-in", "zoom-out": "zoom-out", "vertical-text": "vertical-text", "cell": "cell",
 }
-CURSOR = {"css": "default"}   # latest shape; anything unknown or hidden falls back to a visible arrow
+CURSOR = {"css": "default"}   # latest cursor (CSS name + real image); hidden/unknown falls back to a visible arrow
+
+
+def _png(w, h, rgba):
+    import struct, zlib
+    raw = b"".join(b"\x00" + rgba[y * w * 4:(y + 1) * w * 4] for y in range(h))
+    chunk = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
 
 
 def cursor_watcher(on_change):
-    """Poll the X server's current cursor (XFixes) and report its CSS equivalent when it changes."""
-    import ctypes
+    """Poll the X server's current cursor (XFixes) and report it (real image + hotspot + CSS fallback) when it changes."""
+    import base64, ctypes
     try:
         x11, xf = ctypes.CDLL("libX11.so.6"), ctypes.CDLL("libXfixes.so.3")
 
         class Img(ctypes.Structure):
             _fields_ = [("x", ctypes.c_short), ("y", ctypes.c_short), ("width", ctypes.c_ushort), ("height", ctypes.c_ushort),
                         ("xhot", ctypes.c_ushort), ("yhot", ctypes.c_ushort), ("serial", ctypes.c_ulong),
-                        ("pixels", ctypes.c_void_p), ("atom", ctypes.c_ulong), ("name", ctypes.c_char_p)]
+                        ("pixels", ctypes.POINTER(ctypes.c_ulong)), ("atom", ctypes.c_ulong), ("name", ctypes.c_char_p)]
         x11.XOpenDisplay.restype = ctypes.c_void_p
         xf.XFixesGetCursorImage.restype = ctypes.POINTER(Img)
         xf.XFixesGetCursorImage.argtypes = [ctypes.c_void_p]
@@ -178,19 +201,42 @@ def cursor_watcher(on_change):
     except OSError as e:
         print("cursor sync unavailable:", e, file=sys.stderr)
         return
-    last = None
+    last, cache = None, {}
     while True:
-        time.sleep(0.05)
+        time.sleep(0.04)
         try:
             img = xf.XFixesGetCursorImage(dpy)
             if not img:
                 continue
-            name = (img.contents.name or b"").decode("latin-1").lower()
+            c = img.contents
+            if c.serial == last:
+                x11.XFree(img)
+                continue
+            last = c.serial
+            if c.serial not in cache:
+                name = (c.name or b"").decode("latin-1").lower()
+                css = CURSOR_CSS.get(name, "default")
+                w, h = c.width, c.height
+                msg = {"css": css}
+                if 0 < w <= 96 and 0 < h <= 96:
+                    rgba, visible = bytearray(w * h * 4), False
+                    for i in range(w * h):
+                        v = c.pixels[i] & 0xFFFFFFFF
+                        a, r, g, b = v >> 24, (v >> 16) & 255, (v >> 8) & 255, v & 255
+                        if a:
+                            visible = True
+                            if a < 255:                       # X gives premultiplied alpha, PNG wants straight alpha
+                                r, g, b = min(255, r * 255 // a), min(255, g * 255 // a), min(255, b * 255 // a)
+                        rgba[i * 4:i * 4 + 4] = bytes((r, g, b, a))
+                    if visible:                               # a fully transparent (hidden) cursor stays a visible arrow
+                        msg.update(img="data:image/png;base64," + base64.b64encode(_png(w, h, bytes(rgba))).decode(),
+                                   hx=c.xhot, hy=c.yhot)
+                cache[c.serial] = msg
+                if len(cache) > 64:
+                    cache.pop(next(iter(cache)))
             x11.XFree(img)
-            css = CURSOR_CSS.get(name, "default")
-            if css != last:
-                last, CURSOR["css"] = css, css
-                on_change(css)
+            CURSOR.clear(); CURSOR.update(cache[last])
+            on_change(dict(CURSOR))
         except Exception as e:
             print("cursor watcher error:", e, file=sys.stderr)
             time.sleep(1)
@@ -555,7 +601,7 @@ async def ws_handler(req):
                     me["since"] = int(time.time())
                     notify("Remote viewer connected", f"{me['user']} from {me['ip']}")
                 VIEWER.update(info=me, ws=ws, token=req.cookies.get("nmrd"))
-                await ws.send_json({"type": "cursor", "css": CURSOR["css"]})
+                await ws.send_json({"type": "cursor", **CURSOR})
             elif m["type"] == "answer" and isinstance(sess, Session):
                 sess.on_answer(m["sdp"])
             elif m["type"] == "ice" and isinstance(sess, Session):
@@ -575,10 +621,10 @@ async def ws_handler(req):
     return ws
 
 
-def push_cursor(css):
+def push_cursor(cur):
     sess = ACTIVE["s"]
     if sess:
-        asyncio.run_coroutine_threadsafe(sess.ws.send_json({"type": "cursor", "css": css}), sess.loop)
+        asyncio.run_coroutine_threadsafe(sess.ws.send_json({"type": "cursor", **cur}), sess.loop)
 
 
 def make_app(cfg):
